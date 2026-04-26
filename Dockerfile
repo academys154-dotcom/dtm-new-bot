@@ -10,7 +10,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app ./app
 COPY data ./data
-COPY exports ./exports
+# COPY exports ./exports
 COPY start.sh ./start.sh
 COPY README.md ./README.md
 COPY Procfile ./Procfile
