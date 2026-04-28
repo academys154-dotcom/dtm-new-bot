@@ -62,6 +62,9 @@ BTN_EXPORT_USERS = "📤 Userlar export"
 BTN_EXPORT_RESULTS = "📥 Natijalar export"
 BTN_BROADCAST = "📣 Eslatma"
 BTN_ADMIN_TO_USER = "👥 User menu"
+BTN_ADMIN_CANCEL = "❌ Bekor qilish"
+BTN_EXAM_CONFIRM_SAVE = "✅ Saqlash"
+BTN_EXAM_CONFIRM_CANCEL = "❌ Saqlamaslik"
 
 CATEGORY_EXACT = "📐 Aniq fanlar"
 CATEGORY_NATURAL = "🧪 Tabiiy fanlar"
@@ -102,6 +105,7 @@ INTERRUPTIBLE_USER_TEXTS = {
     BTN_FULL_MOCK, BTN_SUBJECTS, BTN_CHECK, BTN_PROFILE, BTN_GUIDE, BTN_HELP, BTN_CLEAR, BTN_ADMIN,
     BTN_BACK, BTN_HOME, BTN_ENTER_CODE, BTN_FREE_TEST, BTN_TESTS,
     BTN_EXAM_ADD, BTN_EXAM_DELETE, BTN_EXAM_LIST, BTN_CODE_CREATE, BTN_CODE_EDIT, BTN_STATS, BTN_EXPORT_USERS, BTN_EXPORT_RESULTS, BTN_BROADCAST, BTN_ADMIN_TO_USER,
+    BTN_ADMIN_CANCEL, BTN_EXAM_CONFIRM_SAVE, BTN_EXAM_CONFIRM_CANCEL,
     *CATEGORY_SUBJECTS.keys(), *SUBJECTS,
 }
 
@@ -168,6 +172,7 @@ class AdminStates(StatesGroup):
     waiting_exam_pdf = State()
     waiting_exam_answer_key = State()
     waiting_exam_instructions = State()
+    waiting_exam_confirm = State()
     waiting_delete_exam_id = State()
     waiting_code_exam_id = State()
     waiting_code_mode = State()
@@ -287,8 +292,8 @@ def parse_answer_tokens(text: str) -> list[str]:
     if not raw:
         return []
 
-    compact_letters = re.sub(r"[^A-D]", "", raw)
-    remaining = re.sub(r"[A-D\s,;|/\\\-.0-9()_:=]", "", raw)
+    compact_letters = re.sub(r"[^A-E]", "", raw)
+    remaining = re.sub(r"[A-E\s,;|/\\\-.0-9()_:=]", "", raw)
     if compact_letters and not remaining:
         return list(compact_letters)
 
@@ -486,6 +491,8 @@ class Database:
         ensure_parent_dir(self.db_path)
         conn = sqlite3.connect(self.db_path, timeout=30)
         conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA foreign_keys = ON")
+        conn.execute("PRAGMA busy_timeout = 5000")
         return conn
 
     def _column_exists(self, conn: sqlite3.Connection, table_name: str, column_name: str) -> bool:
@@ -578,8 +585,53 @@ class Database:
                 );
                 """
             )
+            # Safe migrations for old Railway volumes.
+            # CREATE TABLE IF NOT EXISTS does not add new columns to an existing SQLite DB,
+            # so every column used by the current code is checked explicitly. This keeps
+            # user/test/code/result data intact when the bot is edited and redeployed.
+            self._ensure_column(conn, "users", "username", "TEXT")
+            self._ensure_column(conn, "users", "full_name", "TEXT")
+            self._ensure_column(conn, "users", "phone", "TEXT")
+            self._ensure_column(conn, "users", "target_grade", "TEXT DEFAULT 'UNKNOWN'")
+            self._ensure_column(conn, "users", "registered_at", "TEXT DEFAULT ''")
+
+            self._ensure_column(conn, "exams", "grade_level", "TEXT DEFAULT 'ALL'")
             self._ensure_column(conn, "exams", "category", "TEXT DEFAULT ''")
+            self._ensure_column(conn, "exams", "subject", "TEXT DEFAULT ''")
+            self._ensure_column(conn, "exams", "duration_minutes", "INTEGER DEFAULT 180")
+            self._ensure_column(conn, "exams", "description", "TEXT DEFAULT ''")
+            self._ensure_column(conn, "exams", "pdf_file_id", "TEXT DEFAULT ''")
+            self._ensure_column(conn, "exams", "answer_key", "TEXT DEFAULT '[]'")
+            self._ensure_column(conn, "exams", "answer_instructions", "TEXT DEFAULT ''")
             self._ensure_column(conn, "exams", "is_free_demo", "INTEGER NOT NULL DEFAULT 0")
+            self._ensure_column(conn, "exams", "is_active", "INTEGER NOT NULL DEFAULT 1")
+            self._ensure_column(conn, "exams", "created_at", "TEXT DEFAULT ''")
+
+            self._ensure_column(conn, "redeem_codes", "created_by_admin", "INTEGER NOT NULL DEFAULT 0")
+            self._ensure_column(conn, "redeem_codes", "created_at", "TEXT DEFAULT ''")
+            self._ensure_column(conn, "redeem_codes", "is_used", "INTEGER NOT NULL DEFAULT 0")
+            self._ensure_column(conn, "redeem_codes", "used_by_tg_user_id", "INTEGER")
+            self._ensure_column(conn, "redeem_codes", "used_at", "TEXT")
+
+            self._ensure_column(conn, "attempts", "user_answers", "TEXT DEFAULT '[]'")
+            self._ensure_column(conn, "attempts", "score", "INTEGER NOT NULL DEFAULT 0")
+            self._ensure_column(conn, "attempts", "total_questions", "INTEGER NOT NULL DEFAULT 0")
+            self._ensure_column(conn, "attempts", "percentage", "REAL NOT NULL DEFAULT 0")
+            self._ensure_column(conn, "attempts", "correct_count", "INTEGER NOT NULL DEFAULT 0")
+            self._ensure_column(conn, "attempts", "wrong_count", "INTEGER NOT NULL DEFAULT 0")
+            self._ensure_column(conn, "attempts", "blank_count", "INTEGER NOT NULL DEFAULT 0")
+            self._ensure_column(conn, "attempts", "five_grade", "INTEGER NOT NULL DEFAULT 0")
+            self._ensure_column(conn, "attempts", "result_text", "TEXT DEFAULT ''")
+            self._ensure_column(conn, "attempts", "created_at", "TEXT DEFAULT ''")
+
+            self._ensure_column(conn, "message_history", "sender_type", "TEXT DEFAULT 'bot'")
+            self._ensure_column(conn, "message_history", "created_at", "TEXT DEFAULT ''")
+
+            self._ensure_column(conn, "free_demo_usage", "exam_id", "INTEGER NOT NULL DEFAULT 0")
+            self._ensure_column(conn, "free_demo_usage", "subject", "TEXT DEFAULT ''")
+            self._ensure_column(conn, "free_demo_usage", "grade_level", "TEXT DEFAULT 'UNKNOWN'")
+            self._ensure_column(conn, "free_demo_usage", "used_at", "TEXT DEFAULT ''")
+
             cur.executescript(
                 """
                 CREATE INDEX IF NOT EXISTS idx_users_tg_user_id ON users(tg_user_id);
@@ -828,6 +880,29 @@ class Database:
                 (normalize_code(code), tg_user_id),
             ).fetchone()
 
+    def get_free_demo_by_code_for_user(self, code: str, tg_user_id: int) -> Optional[sqlite3.Row]:
+        code = normalize_code(code)
+        expected_prefix = f"FREE-{tg_user_id}-"
+        if not code.startswith(expected_prefix):
+            return None
+        exam_id_text = code.removeprefix(expected_prefix)
+        if not exam_id_text.isdigit():
+            return None
+        exam_id = int(exam_id_text)
+        with closing(self.connect()) as conn:
+            return conn.execute(
+                """
+                SELECT fdu.id AS free_usage_id, ? AS code, e.id AS exam_id,
+                       e.title, e.grade_level, e.subject, e.category, e.duration_minutes, e.description,
+                       e.pdf_file_id, e.answer_key, e.answer_instructions, e.is_free_demo
+                FROM free_demo_usage fdu
+                JOIN exams e ON e.id = fdu.exam_id
+                WHERE fdu.tg_user_id = ? AND fdu.exam_id = ? AND e.is_active = 1 AND e.is_free_demo = 1
+                LIMIT 1
+                """,
+                (code, tg_user_id, exam_id),
+            ).fetchone()
+
     def save_attempt(self, tg_user_id: int, exam_id: int, code: str, user_answers_tokens: list[str], result: dict) -> None:
         with closing(self.connect()) as conn:
             conn.execute(
@@ -968,6 +1043,91 @@ def admin_menu() -> ReplyKeyboardMarkup:
             [KeyboardButton(text=BTN_ADMIN_TO_USER), KeyboardButton(text=BTN_CLEAR)],
         ],
         resize_keyboard=True,
+    )
+
+
+
+def admin_flow_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text=BTN_ADMIN_CANCEL)],
+            [KeyboardButton(text=BTN_ADMIN), KeyboardButton(text=BTN_ADMIN_TO_USER)],
+        ],
+        resize_keyboard=True,
+        input_field_placeholder="Ma'lumot yuboring yoki bekor qiling",
+    )
+
+
+def exam_confirm_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text=BTN_EXAM_CONFIRM_SAVE), KeyboardButton(text=BTN_EXAM_CONFIRM_CANCEL)],
+            [KeyboardButton(text=BTN_ADMIN)],
+        ],
+        resize_keyboard=True,
+        one_time_keyboard=True,
+    )
+
+
+async def handle_admin_flow_interrupt(message: Message, state: FSMContext) -> bool:
+    text = compact_spaces(message.text or "")
+    lowered = text.lower()
+
+    if not is_admin(message.from_user.id):
+        await state.clear()
+        await tracked_answer(message, "Siz admin emassiz.", reply_markup=main_menu(message.from_user.id))
+        return True
+
+    if text == BTN_CLEAR:
+        await clear_history(message, state)
+        return True
+
+    if text in {BTN_ADMIN_CANCEL, BTN_ADMIN, BTN_BACK} or lowered in {"cancel", "bekor", "bekor qilish", "/cancel"}:
+        await state.clear()
+        await remember_numbered_options(state, ADMIN_MENU_OPTIONS)
+        await tracked_answer(message, "❌ Jarayon bekor qilindi.\n\n" + admin_menu_text(), reply_markup=admin_menu())
+        return True
+
+    if text in {BTN_HOME, BTN_ADMIN_TO_USER} or lowered == "/start":
+        await state.clear()
+        await remember_numbered_options(state, main_menu_options(message.from_user.id))
+        await tracked_answer(message, "🏠 Asosiy menu ochildi.\n\n" + main_menu_text(message.from_user.id), reply_markup=main_menu(message.from_user.id))
+        return True
+
+    if text in {BTN_EXAM_ADD, BTN_EXAM_DELETE, BTN_EXAM_LIST, BTN_CODE_CREATE, BTN_CODE_EDIT, BTN_STATS, BTN_EXPORT_USERS, BTN_EXPORT_RESULTS, BTN_BROADCAST}:
+        await tracked_answer(message, "Avval joriy admin jarayonini tugating yoki bekor qiling.", reply_markup=admin_flow_keyboard())
+        return True
+
+    return False
+
+
+def parse_duration_input(text: str) -> Optional[int]:
+    raw = compact_spaces(text).lower()
+    if raw in {"-", "default", "standart"}:
+        return DEFAULT_DURATION
+    if not raw.isdigit():
+        return None
+    value = int(raw)
+    if value <= 0 or value > 600:
+        return None
+    return value
+
+
+def build_exam_preview(data: dict, instructions: str = "") -> str:
+    answers = data.get("exam_answer_key", []) or []
+    free_label = "Ha" if data.get("exam_is_free") else "Yo'q"
+    return (
+        "📋 <b>Yangi test ma'lumotlari</b>\n\n"
+        f"Nom: <b>{escape_html_text(data.get('exam_title', '-'))}</b>\n"
+        f"Sinf: {escape_html_text(grade_label(data.get('exam_grade', '')))}\n"
+        f"Kategoriya: {escape_html_text(data.get('exam_category', '-'))}\n"
+        f"Fan: {escape_html_text(data.get('exam_subject', '-'))}\n"
+        f"Vaqt: {int(data.get('exam_duration', DEFAULT_DURATION))} daqiqa\n"
+        f"Free demo: {free_label}\n"
+        f"Savollar soni: {len(answers)}\n"
+        f"Izoh: {escape_html_text(data.get('exam_description') or '-')}\n"
+        f"Yo'riqnoma: {escape_html_text(instructions or '-')}\n\n"
+        "Saqlashdan oldin tekshiring. Ma'lumotlar to'g'ri bo'lsa <b>✅ Saqlash</b> ni bosing."
     )
 
 
@@ -1341,75 +1501,93 @@ async def registration_grade_handler(message: Message, state: FSMContext) -> Non
 @router.message(AdminStates.waiting_exam_title, F.content_type == ContentType.TEXT)
 async def admin_exam_title(message: Message, state: FSMContext) -> None:
     await track_incoming(message)
+    if await handle_admin_flow_interrupt(message, state):
+        return
     title = compact_spaces(message.text or "")
     if len(title) < 3:
         await tracked_answer(message, "Nom juda qisqa. Qayta yuboring:")
         return
     await state.update_data(exam_title=title)
     await state.set_state(AdminStates.waiting_exam_grade)
-    await tracked_answer(message, numbered_prompt("Test qaysi sinf uchun?", [label for label, _ in GRADE_OPTIONS]), reply_markup=ReplyKeyboardRemove())
+    await tracked_answer(message, numbered_prompt("Test qaysi sinf uchun?", [label for label, _ in GRADE_OPTIONS]), reply_markup=admin_flow_keyboard())
 
 
 @router.message(AdminStates.waiting_exam_grade, F.content_type == ContentType.TEXT)
 async def admin_exam_grade(message: Message, state: FSMContext) -> None:
     await track_incoming(message)
+    if await handle_admin_flow_interrupt(message, state):
+        return
     grade = pick_labeled_value(message.text or "", GRADE_OPTIONS) or normalize_grade_value(message.text or "")
     if not grade:
-        await tracked_answer(message, numbered_prompt("Faqat quyidagilardan birini tanlang:", [label for label, _ in GRADE_OPTIONS]))
+        await tracked_answer(message, numbered_prompt("Faqat quyidagilardan birini tanlang:", [label for label, _ in GRADE_OPTIONS]), reply_markup=admin_flow_keyboard())
         return
     await state.update_data(exam_grade=grade)
     await state.set_state(AdminStates.waiting_exam_category)
-    await tracked_answer(message, numbered_prompt("Kategoriya tanlang:", list(CATEGORY_SUBJECTS.keys())))
+    await tracked_answer(message, numbered_prompt("Kategoriya tanlang:", list(CATEGORY_SUBJECTS.keys())), reply_markup=admin_flow_keyboard())
 
 
 @router.message(AdminStates.waiting_exam_category, F.content_type == ContentType.TEXT)
 async def admin_exam_category(message: Message, state: FSMContext) -> None:
     await track_incoming(message)
+    if await handle_admin_flow_interrupt(message, state):
+        return
     category = pick_numbered_value(message.text or "", list(CATEGORY_SUBJECTS.keys())) or normalize_category(message.text or "")
     if not category:
-        await tracked_answer(message, numbered_prompt("Kategoriya noto'g'ri. Tayyor variantlardan birini tanlang:", list(CATEGORY_SUBJECTS.keys())))
+        await tracked_answer(message, numbered_prompt("Kategoriya noto'g'ri. Tayyor variantlardan birini tanlang:", list(CATEGORY_SUBJECTS.keys())), reply_markup=admin_flow_keyboard())
         return
     await state.update_data(exam_category=category)
     await state.set_state(AdminStates.waiting_exam_subject)
-    await tracked_answer(message, numbered_prompt("Fan nomini tanlang:", CATEGORY_SUBJECTS[category]))
+    await tracked_answer(message, numbered_prompt("Fan nomini tanlang:", CATEGORY_SUBJECTS[category]), reply_markup=admin_flow_keyboard())
 
 
 @router.message(AdminStates.waiting_exam_subject, F.content_type == ContentType.TEXT)
 async def admin_exam_subject(message: Message, state: FSMContext) -> None:
     await track_incoming(message)
+    if await handle_admin_flow_interrupt(message, state):
+        return
     data = await state.get_data()
     category = data.get("exam_category", "")
     subject = pick_numbered_value(message.text or "", CATEGORY_SUBJECTS.get(category, [])) or normalize_subject(message.text or "")
     if not subject or subject not in CATEGORY_SUBJECTS.get(category, []):
-        await tracked_answer(message, numbered_prompt("Fan noto'g'ri yoki kategoriya bilan mos emas. Qayta tanlang:", CATEGORY_SUBJECTS.get(category, [])))
+        await tracked_answer(message, numbered_prompt("Fan noto'g'ri yoki kategoriya bilan mos emas. Qayta tanlang:", CATEGORY_SUBJECTS.get(category, [])), reply_markup=admin_flow_keyboard())
         return
     await state.update_data(exam_subject=subject)
     await state.set_state(AdminStates.waiting_exam_duration)
-    await tracked_answer(message, f"Davomiylikni daqiqada yuboring. Masalan 180. Bo'sh qoldirsangiz {DEFAULT_DURATION} bo'ladi.")
+    await tracked_answer(message, f"Davomiylikni daqiqada yuboring. Masalan: 180. Standart {DEFAULT_DURATION} daqiqa bo'lsin desangiz '-' yuboring.", reply_markup=admin_flow_keyboard())
 
 
 @router.message(AdminStates.waiting_exam_duration, F.content_type == ContentType.TEXT)
 async def admin_exam_duration(message: Message, state: FSMContext) -> None:
     await track_incoming(message)
-    await state.update_data(exam_duration=parse_positive_int(message.text or "", DEFAULT_DURATION))
+    if await handle_admin_flow_interrupt(message, state):
+        return
+    duration = parse_duration_input(message.text or "")
+    if duration is None:
+        await tracked_answer(message, f"Faqat 1 dan 600 gacha raqam yuboring. Standart {DEFAULT_DURATION} daqiqa uchun '-' yuboring.", reply_markup=admin_flow_keyboard())
+        return
+    await state.update_data(exam_duration=duration)
     await state.set_state(AdminStates.waiting_exam_description)
-    await tracked_answer(message, "Qisqa izoh yuboring. Kerak bo'lmasa '-' yuboring.")
+    await tracked_answer(message, "Qisqa izoh yuboring. Kerak bo'lmasa '-' yuboring.", reply_markup=admin_flow_keyboard())
 
 
 @router.message(AdminStates.waiting_exam_description, F.content_type == ContentType.TEXT)
 async def admin_exam_description(message: Message, state: FSMContext) -> None:
     await track_incoming(message)
+    if await handle_admin_flow_interrupt(message, state):
+        return
     desc = compact_spaces(message.text or "")
     if desc == "-":
         desc = ""
     await state.update_data(exam_description=desc)
     await state.set_state(AdminStates.waiting_exam_free_flag)
-    await tracked_answer(message, numbered_prompt("Bu test bir martalik tekin testmi?", [label for label, _ in YES_NO_OPTIONS]))
+    await tracked_answer(message, numbered_prompt("Bu test bir martalik tekin testmi?", [label for label, _ in YES_NO_OPTIONS]), reply_markup=admin_flow_keyboard())
 
 
 @router.message(AdminStates.waiting_exam_free_flag, F.content_type == ContentType.TEXT)
 async def admin_exam_free_flag(message: Message, state: FSMContext) -> None:
     await track_incoming(message)
+    if await handle_admin_flow_interrupt(message, state):
+        return
     raw = compact_spaces(message.text or "").lower()
     choice = pick_labeled_value(message.text or "", YES_NO_OPTIONS)
     if choice == "yes" or raw in {"ha", "yes"}:
@@ -1417,49 +1595,93 @@ async def admin_exam_free_flag(message: Message, state: FSMContext) -> None:
     elif choice == "no" or raw in {"yo'q", "yoq", "no", "0"}:
         is_free = False
     else:
-        await tracked_answer(message, numbered_prompt("Faqat Ha yoki Yo'q tanlang:", [label for label, _ in YES_NO_OPTIONS]))
+        await tracked_answer(message, numbered_prompt("Faqat Ha yoki Yo'q tanlang:", [label for label, _ in YES_NO_OPTIONS]), reply_markup=admin_flow_keyboard())
         return
     await state.update_data(exam_is_free=is_free)
     await state.set_state(AdminStates.waiting_exam_pdf)
-    await tracked_answer(message, "Endi test PDF faylini yuboring.")
+    await tracked_answer(message, "Endi test PDF faylini yuboring.", reply_markup=admin_flow_keyboard())
 
 
 @router.message(AdminStates.waiting_exam_pdf, F.document)
 async def admin_exam_pdf(message: Message, state: FSMContext) -> None:
     await track_incoming(message)
+    if await handle_admin_flow_interrupt(message, state):
+        return
     if not is_pdf_document(message):
-        await tracked_answer(message, "Faqat PDF fayl yuboring.")
+        await tracked_answer(message, "Faqat PDF fayl yuboring.", reply_markup=admin_flow_keyboard())
         return
     await state.update_data(exam_pdf_file_id=message.document.file_id)
     await state.set_state(AdminStates.waiting_exam_answer_key)
-    await tracked_answer(message, "Javoblar kalitini yuboring. Masalan: ABCDABCD yoki A B C D yoki 1-A, 2-B")
+    await tracked_answer(message, "Javoblar kalitini yuboring. Masalan: ABCDABCD yoki A B C D yoki 1-A, 2-B", reply_markup=admin_flow_keyboard())
 
 
 @router.message(AdminStates.waiting_exam_pdf)
 async def admin_exam_pdf_fallback(message: Message, state: FSMContext) -> None:
     await track_incoming(message)
-    await tracked_answer(message, "PDF fayl yuboring.")
+    if await handle_admin_flow_interrupt(message, state):
+        return
+    await tracked_answer(message, "PDF fayl yuboring.", reply_markup=admin_flow_keyboard())
 
 
 @router.message(AdminStates.waiting_exam_answer_key, F.content_type == ContentType.TEXT)
 async def admin_exam_answer_key(message: Message, state: FSMContext) -> None:
     await track_incoming(message)
+    if await handle_admin_flow_interrupt(message, state):
+        return
     tokens = parse_answer_tokens(message.text or "")
     if len(tokens) < 2:
-        await tracked_answer(message, "Kamida 2 ta javob bo'lishi kerak. Qayta yuboring.")
+        await tracked_answer(message, "Kamida 2 ta javob bo'lishi kerak. Qayta yuboring.", reply_markup=admin_flow_keyboard())
         return
     await state.update_data(exam_answer_key=tokens)
     await state.set_state(AdminStates.waiting_exam_instructions)
-    await tracked_answer(message, "Javob yuborish yo'riqnomasini yozing yoki '-' yuboring.")
+    await tracked_answer(message, "Javob yuborish yo'riqnomasini yozing yoki '-' yuboring.", reply_markup=admin_flow_keyboard())
 
 
 @router.message(AdminStates.waiting_exam_instructions, F.content_type == ContentType.TEXT)
 async def admin_exam_instructions(message: Message, state: FSMContext) -> None:
     await track_incoming(message)
+    if await handle_admin_flow_interrupt(message, state):
+        return
     data = await state.get_data()
     instructions = compact_spaces(message.text or "")
     if instructions == "-":
         instructions = ""
+    await state.update_data(exam_instructions=instructions)
+    data = await state.get_data()
+    await state.set_state(AdminStates.waiting_exam_confirm)
+    await tracked_answer(message, build_exam_preview(data, instructions), reply_markup=exam_confirm_keyboard())
+
+
+
+@router.message(AdminStates.waiting_exam_confirm, F.content_type == ContentType.TEXT)
+async def admin_exam_confirm(message: Message, state: FSMContext) -> None:
+    await track_incoming(message)
+    text = compact_spaces(message.text or "")
+    if text in {BTN_EXAM_CONFIRM_CANCEL, BTN_ADMIN_CANCEL}:
+        await state.clear()
+        await remember_numbered_options(state, ADMIN_MENU_OPTIONS)
+        await tracked_answer(message, "❌ Test saqlanmadi.\n\n" + admin_menu_text(), reply_markup=admin_menu())
+        return
+    if text != BTN_EXAM_CONFIRM_SAVE:
+        if await handle_admin_flow_interrupt(message, state):
+            return
+        await tracked_answer(message, "Testni saqlash uchun ✅ Saqlash ni bosing yoki ❌ Saqlamaslik ni tanlang.", reply_markup=exam_confirm_keyboard())
+        return
+
+    if not is_admin(message.from_user.id):
+        await state.clear()
+        await tracked_answer(message, "Siz admin emassiz.", reply_markup=main_menu(message.from_user.id))
+        return
+
+    data = await state.get_data()
+    required = ["exam_title", "exam_grade", "exam_category", "exam_subject", "exam_duration", "exam_pdf_file_id", "exam_answer_key"]
+    missing = [key for key in required if key not in data]
+    if missing:
+        await state.clear()
+        await remember_numbered_options(state, ADMIN_MENU_OPTIONS)
+        await tracked_answer(message, "❌ Test ma'lumotlari to'liq emas. Qaytadan test qo'shing.\n\n" + admin_menu_text(), reply_markup=admin_menu())
+        return
+
     exam_id = DB.create_exam(
         title=data["exam_title"],
         grade_level=data["exam_grade"],
@@ -1469,7 +1691,7 @@ async def admin_exam_instructions(message: Message, state: FSMContext) -> None:
         description=data.get("exam_description", ""),
         pdf_file_id=data["exam_pdf_file_id"],
         answer_key_tokens=data["exam_answer_key"],
-        answer_instructions=instructions,
+        answer_instructions=data.get("exam_instructions", ""),
         is_free_demo=bool(data.get("exam_is_free", False)),
     )
     await state.clear()
@@ -1480,6 +1702,8 @@ async def admin_exam_instructions(message: Message, state: FSMContext) -> None:
 @router.message(AdminStates.waiting_delete_exam_id, F.content_type == ContentType.TEXT)
 async def admin_delete_exam(message: Message, state: FSMContext) -> None:
     await track_incoming(message)
+    if await handle_admin_flow_interrupt(message, state):
+        return
     data = await state.get_data()
     exam_ids = [int(x) for x in data.get("delete_exam_ids", [])]
     exam_id = pick_exam_id_from_number(message.text or "", exam_ids)
@@ -1495,6 +1719,8 @@ async def admin_delete_exam(message: Message, state: FSMContext) -> None:
 @router.message(AdminStates.waiting_code_exam_id, F.content_type == ContentType.TEXT)
 async def admin_code_exam_id(message: Message, state: FSMContext) -> None:
     await track_incoming(message)
+    if await handle_admin_flow_interrupt(message, state):
+        return
     data = await state.get_data()
     exam_ids = [int(x) for x in data.get("code_exam_ids", [])]
     exam_id = pick_exam_id_from_number(message.text or "", exam_ids)
@@ -1503,31 +1729,35 @@ async def admin_code_exam_id(message: Message, state: FSMContext) -> None:
         return
     await state.update_data(code_exam_id=exam_id)
     await state.set_state(AdminStates.waiting_code_mode)
-    await tracked_answer(message, numbered_prompt("Kod yaratish turini tanlang:", [label for label, _ in CODE_MODE_OPTIONS]))
+    await tracked_answer(message, numbered_prompt("Kod yaratish turini tanlang:", [label for label, _ in CODE_MODE_OPTIONS]), reply_markup=admin_flow_keyboard())
 
 
 @router.message(AdminStates.waiting_code_mode, F.content_type == ContentType.TEXT)
 async def admin_code_mode(message: Message, state: FSMContext) -> None:
     await track_incoming(message)
+    if await handle_admin_flow_interrupt(message, state):
+        return
     raw = pick_labeled_value(message.text or "", CODE_MODE_OPTIONS)
     if raw == "1":
         await state.set_state(AdminStates.waiting_single_code)
-        await tracked_answer(message, "Kodning o'zini yuboring.")
+        await tracked_answer(message, "Kodning o'zini yuboring.", reply_markup=admin_flow_keyboard())
         return
     if raw == "2":
         await state.set_state(AdminStates.waiting_bulk_codes)
-        await tracked_answer(message, "Kodlarni bo'shliq yoki qator bilan yuboring.")
+        await tracked_answer(message, "Kodlarni bo'shliq yoki qator bilan yuboring.", reply_markup=admin_flow_keyboard())
         return
-    await tracked_answer(message, numbered_prompt("Faqat quyidagilardan birini tanlang:", [label for label, _ in CODE_MODE_OPTIONS]))
+    await tracked_answer(message, numbered_prompt("Faqat quyidagilardan birini tanlang:", [label for label, _ in CODE_MODE_OPTIONS]), reply_markup=admin_flow_keyboard())
 
 
 @router.message(AdminStates.waiting_single_code, F.content_type == ContentType.TEXT)
 async def admin_single_code(message: Message, state: FSMContext) -> None:
     await track_incoming(message)
+    if await handle_admin_flow_interrupt(message, state):
+        return
     data = await state.get_data()
     code = normalize_code(message.text or "")
     if not code:
-        await tracked_answer(message, "Kod bo'sh bo'lmasin.")
+        await tracked_answer(message, "Kod bo'sh bo'lmasin.", reply_markup=admin_flow_keyboard())
         return
     ok = DB.create_code(code, int(data["code_exam_id"]), message.from_user.id)
     await state.clear()
@@ -1538,6 +1768,8 @@ async def admin_single_code(message: Message, state: FSMContext) -> None:
 @router.message(AdminStates.waiting_bulk_codes, F.content_type == ContentType.TEXT)
 async def admin_bulk_codes(message: Message, state: FSMContext) -> None:
     await track_incoming(message)
+    if await handle_admin_flow_interrupt(message, state):
+        return
     data = await state.get_data()
     raw_codes = re.split(r"[\s,;|]+", message.text or "")
     created, skipped = DB.bulk_create_codes(raw_codes, int(data["code_exam_id"]), message.from_user.id)
@@ -1549,20 +1781,24 @@ async def admin_bulk_codes(message: Message, state: FSMContext) -> None:
 @router.message(AdminStates.waiting_edit_code_old, F.content_type == ContentType.TEXT)
 async def admin_edit_code_old(message: Message, state: FSMContext) -> None:
     await track_incoming(message)
+    if await handle_admin_flow_interrupt(message, state):
+        return
     data = await state.get_data()
     old_code = pick_code_from_number_or_text(message.text or "", data.get("edit_code_values", []))
     row = DB.get_code_basic(old_code)
     if not row:
-        await tracked_answer(message, "Kod topilmadi. Ro'yxat raqami yoki mavjud kodni yuboring.")
+        await tracked_answer(message, "Kod topilmadi. Ro'yxat raqami yoki mavjud kodni yuboring.", reply_markup=admin_flow_keyboard())
         return
     await state.update_data(edit_old_code=row["code"])
     await state.set_state(AdminStates.waiting_edit_code_new)
-    await tracked_answer(message, f"Eski kod: <code>{escape_html_text(row['code'])}</code>\nYangi kodni yuboring:")
+    await tracked_answer(message, f"Eski kod: <code>{escape_html_text(row['code'])}</code>\nYangi kodni yuboring:", reply_markup=admin_flow_keyboard())
 
 
 @router.message(AdminStates.waiting_edit_code_new, F.content_type == ContentType.TEXT)
 async def admin_edit_code_new(message: Message, state: FSMContext) -> None:
     await track_incoming(message)
+    if await handle_admin_flow_interrupt(message, state):
+        return
     data = await state.get_data()
     old_code = data.get("edit_old_code", "")
     new_code = normalize_code(message.text or "")
@@ -1575,6 +1811,8 @@ async def admin_edit_code_new(message: Message, state: FSMContext) -> None:
 @router.message(AdminStates.waiting_export_users_format, F.content_type == ContentType.TEXT)
 async def admin_export_users(message: Message, state: FSMContext) -> None:
     await track_incoming(message)
+    if await handle_admin_flow_interrupt(message, state):
+        return
     raw = compact_spaces(message.text or "")
     raw = pick_labeled_value(message.text or "", EXPORT_FORMAT_OPTIONS) or raw
     if raw not in {"1", "2"}:
@@ -1588,6 +1826,8 @@ async def admin_export_users(message: Message, state: FSMContext) -> None:
 @router.message(AdminStates.waiting_export_results_format, F.content_type == ContentType.TEXT)
 async def admin_export_results(message: Message, state: FSMContext) -> None:
     await track_incoming(message)
+    if await handle_admin_flow_interrupt(message, state):
+        return
     raw = compact_spaces(message.text or "")
     raw = pick_labeled_value(message.text or "", EXPORT_FORMAT_OPTIONS) or raw
     if raw not in {"1", "2"}:
@@ -1601,6 +1841,8 @@ async def admin_export_results(message: Message, state: FSMContext) -> None:
 @router.message(AdminStates.waiting_broadcast_text, F.content_type == ContentType.TEXT)
 async def admin_broadcast(message: Message, state: FSMContext) -> None:
     await track_incoming(message)
+    if await handle_admin_flow_interrupt(message, state):
+        return
     users = DB.list_users()
     text = compact_spaces(message.text or "")
     sent_count = 0
@@ -1662,6 +1904,8 @@ async def user_check_code_handler(message: Message, state: FSMContext) -> None:
         return
     code = normalize_code(raw_text)
     row = DB.get_redeemed_code_for_user(code, message.from_user.id)
+    if not row:
+        row = DB.get_free_demo_by_code_for_user(code, message.from_user.id)
     if not row:
         await tracked_answer(message, "Bu kod siz tomonidan ishlatilmagan yoki faol emas.", reply_markup=main_menu(message.from_user.id))
         return
@@ -1877,7 +2121,7 @@ async def text_router(message: Message, state: FSMContext) -> None:
 
     if text == BTN_EXAM_ADD:
         await state.set_state(AdminStates.waiting_exam_title)
-        await tracked_answer(message, "Yangi test nomini yuboring:", reply_markup=ReplyKeyboardRemove())
+        await tracked_answer(message, "Yangi test nomini yuboring:", reply_markup=admin_flow_keyboard())
         return
 
     if text == BTN_EXAM_DELETE:
