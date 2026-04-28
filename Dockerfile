@@ -15,7 +15,6 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app ./app
 COPY start.sh .
-COPY .env.example .
 
 RUN chmod +x /app/start.sh && mkdir -p /app/data /app/exports
 
